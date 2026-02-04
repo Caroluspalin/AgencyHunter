@@ -22,3 +22,42 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# --- Security: ÄLÄ KOSKAAN PUSHAA NÄITÄ ---
+.env
+.env.*
+*.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual Environments ---
+venv/
+env/
+.venv/
+
+# --- OS specific ---
+.DS_Store
+Thumbs.db
+
+# --- IDEs ---
+.vscode/
+.idea/
+
+# --- Python & Backend ---
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.local
+
+# --- Tietokannat ---
+*.sqlite3
+*.db
+postgres_data/
+
+# --- Käyttöjärjestelmän turhat ---
+.DS_Store

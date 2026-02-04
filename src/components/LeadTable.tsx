@@ -1,16 +1,20 @@
 import React from 'react';
 import { ExternalLink, PlusCircle } from 'lucide-react';
 
-const mockLeads = [
-  { id: 1, name: 'Solis Dental Care', url: 'solisdental.fi', status: 'Needs Fix' },
-  { id: 2, name: 'Nordic Law Group', url: 'nordiclaw.com', status: 'Mobile Friendly' },
-  { id: 3, name: 'Helsinki Pet Clinic', url: 'petclinic.fi', status: 'Needs Fix' },
-  { id: 4, name: 'Peak Fitness Gym', url: 'peakfit.io', status: 'Mobile Friendly' },
-  { id: 5, name: 'The Golden Bistro', url: 'goldenbistro.net', status: 'Needs Fix' },
-  { id: 6, name: 'Urban Architects', url: 'urban-arch.com', status: 'Mobile Friendly' },
-];
+// Määritellään samat tyypit
+interface Lead {
+  id: number;
+  name: string;
+  url: string;
+  status: string;
+}
 
-const LeadTable: React.FC = () => {
+interface Props {
+  leads: Lead[];
+}
+
+// Komponentti ottaa nyt vastaan "leads"-listan
+const LeadTable: React.FC<Props> = ({ leads }) => {
   return (
     <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
       <table className="w-full text-left border-collapse">
@@ -23,30 +27,38 @@ const LeadTable: React.FC = () => {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
-          {mockLeads.map((lead) => (
-            <tr key={lead.id} className="hover:bg-slate-50/50 transition-colors group">
-              <td className="px-6 py-4 text-sm font-medium text-slate-900">{lead.name}</td>
-              <td className="px-6 py-4 text-sm text-slate-500">
-                <span className="flex items-center gap-1">
-                  {lead.url} <ExternalLink size={12} className="opacity-0 group-hover:opacity-100 transition-opacity" />
-                </span>
-              </td>
-              <td className="px-6 py-4">
-                <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${
-                  lead.status === 'Mobile Friendly' 
-                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' 
-                    : 'bg-rose-50 text-rose-700 border border-rose-100'
-                }`}>
-                  {lead.status}
-                </span>
-              </td>
-              <td className="px-6 py-4 text-right">
-                <button className="inline-flex items-center gap-2 text-slate-700 hover:text-indigo-600 font-medium text-sm">
-                  <PlusCircle size={16} /> Save Lead
-                </button>
+          {leads.length === 0 ? (
+            <tr>
+              <td colSpan={4} className="px-6 py-8 text-center text-slate-500">
+                Ei tuloksia haulla.
               </td>
             </tr>
-          ))}
+          ) : (
+            leads.map((lead) => (
+              <tr key={lead.id} className="hover:bg-slate-50/50 transition-colors group">
+                <td className="px-6 py-4 text-sm font-medium text-slate-900">{lead.name}</td>
+                <td className="px-6 py-4 text-sm text-slate-500">
+                  <span className="flex items-center gap-1">
+                    {lead.url} <ExternalLink size={12} className="opacity-0 group-hover:opacity-100 transition-opacity" />
+                  </span>
+                </td>
+                <td className="px-6 py-4">
+                  <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${
+                    lead.status === 'Mobile Friendly' 
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' 
+                      : 'bg-rose-50 text-rose-700 border border-rose-100'
+                  }`}>
+                    {lead.status}
+                  </span>
+                </td>
+                <td className="px-6 py-4 text-right">
+                  <button className="inline-flex items-center gap-2 text-slate-700 hover:text-indigo-600 font-medium text-sm">
+                    <PlusCircle size={16} /> Save Lead
+                  </button>
+                </td>
+              </tr>
+            ))
+          )}
         </tbody>
       </table>
     </div>
