@@ -1,207 +1,332 @@
-# backend/app/main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from app.core.config import settings
-import requests
-from bs4 import BeautifulSoup
+import os
 import time
+import math
 import logging
+import asyncio
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Dict, Set, Tuple
+from urllib.parse import urlparse
 
-# Asetetaan lokitus
-logging.basicConfig(level=logging.INFO)
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from bs4 import BeautifulSoup
+
+# --- CONFIGURATION & SAFETY LIMITS ---
+
+# 1. API Key Setup
+# Option A: Export in terminal (Best practice) -> export GOOGLE_MAPS_API_KEY="AIza..."
+# Option B: Paste here for quick testing (Don't commit to GitHub!)
+GOOGLE_API_KEY = "AIzaSy...SINUN_PITKÄ_AVAIMESI_TÄHÄN"
+# GOOGLE_API_KEY = "PASTE_YOUR_KEY_HERE_IF_TESTING_LOCALLY"
+
+# 2. HARD SAFETY LIMITS (DEV MODE)
+# Keeps you within the $200 free tier easily.
+MAX_GRID_POINTS_SAFETY = 9   # Max 3x3 grid. Prevents scanning huge areas.
+MAX_RESULTS_SAFETY = 200      # Stop searching after finding this many unique leads.
+GRID_RADIUS_METERS = 2000    # 2km radius per scan
+MAX_WORKERS_WEBSITE = 5      # Low concurrency to be gentle on CPU/Net
+
+# Google Places API Endpoints
+BASE_URL = "https://maps.googleapis.com/maps/api/place"
+TEXT_SEARCH_URL = f"{BASE_URL}/textsearch/json"
+NEARBY_SEARCH_URL = f"{BASE_URL}/nearbysearch/json"
+DETAILS_URL = f"{BASE_URL}/details/json"
+GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title=settings.PROJECT_NAME)
-
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
+app = FastAPI(title="Google Maps Lead Miner (Safety Mode)", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- SANAKIRJA: Suomi -> OpenStreetMap Tagit ---
-# Tämä muuttaa hakusanasi tietokantahauksi
-KEYWORD_MAPPING = {
-    "autokorjaamo": ['["shop"="car_repair"]', '["craft"="car_repair"]', '["service"="vehicle:repair"]'],
-    "autohuolto": ['["shop"="car_repair"]'],
-    "kampaamo": ['["shop"="hairdresser"]'],
-    "parturi": ['["shop"="hairdresser"]'],
-    "hammaslääkäri": ['["amenity"="dentist"]', '["healthcare"="dentist"]'],
-    "ravintola": ['["amenity"="restaurant"]'],
-    "pizzeria": ['["cuisine"="pizza"]'],
-    "kahvila": ['["amenity"="cafe"]'],
-    "kuntosali": ['["leisure"="fitness_centre"]', '["sport"="fitness"]'],
-    "tilitoimisto": ['["office"="accountant"]'],
-    "lakitoimisto": ['["office"="lawyer"]'],
-    "apteekki": ['["amenity"="pharmacy"]'],
-    "kukkakauppa": ['["shop"="florist"]'],
-    "kiinteistönvälitys": ['["office"="estate_agent"]']
+# --- MAPPINGS ---
+
+TYPE_MAPPING = {
+    "autokorjaamo": "car_repair",
+    "autohuolto": "car_repair",
+    "kampaamo": "hair_care",
+    "parturi": "hair_care",
+    "kauneushoitola": "beauty_salon",
+    "hammaslääkäri": "dentist",
+    "ravintola": "restaurant",
+    "tilitoimisto": "accounting",
+    "lakitoimisto": "lawyer",
+    "kiinteistönvälitys": "real_estate_agency",
+    "kuntosali": "gym",
+    "apteekki": "pharmacy"
 }
 
-def analyze_website(url: str):
-    """Crawler: Tarkistaa nettisivun tilan."""
-    try:
-        if not url: return "NO WEBSITE 🔴"
+# --- DATA MODELS ---
+
+class Lead(BaseModel):
+    id: int
+    name: str
+    place_id: str
+    types: List[str]
+    address: str
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    status: str
+    rating: Optional[float] = None
+    user_ratings_total: Optional[int] = None
+    discovery_method: str
+
+# --- HELPER CLASSES ---
+
+class GooglePlacesService:
+    def __init__(self, api_key: str):
+        self.key = api_key
+
+    def _make_request(self, url: str, params: Dict) -> Dict:
+        """Wrapper for API requests with basic error handling."""
+        if not self.key:
+            logger.error("No API Key provided.")
+            return {}
             
-        # Some-sivut
-        if any(x in url.lower() for x in ["facebook.com", "instagram.com", "linkedin.com", "tori.fi", "020202", "finder", "fonecta"]):
-            return "NO WEBSITE (Social Only) 🔴"
+        params["key"] = self.key
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Google API Error: {e}")
+            return {}
 
-        if not url.startswith("http"): url = "http://" + url
-
-        headers = {'User-Agent': 'AgencyHunterBot/1.0'}
-        # Lyhyt timeout, koska tuloksia on nyt paljon
-        response = requests.get(url, headers=headers, timeout=4)
+    def get_city_bounds(self, city_name: str) -> Optional[Dict]:
+        """Resolves a city name to a viewport (Bounding Box)."""
+        data = self._make_request(GEOCODE_URL, {"address": f"{city_name}, Finland"})
+        if not data.get("results"):
+            return None
         
-        if response.status_code != 200: return "Broken Website 🔴"
+        geometry = data["results"][0]["geometry"]
+        location = geometry["location"]
         
-        soup = BeautifulSoup(response.text, 'html.parser')
-        title = soup.title.string if soup.title else ""
-        
-        if "IIS Windows" in title or "Under Construction" in title: return "Broken Website 🔴"
-        
-        viewport = soup.find("meta", attrs={"name": "viewport"})
-        return "Mobile Friendly 🟢" if viewport else "Not Mobile Optimized 🟡"
-            
-    except Exception:
-        return "Error Loading Site 🟠"
-
-def fetch_mass_data_from_overpass(query):
-    """
-    Käyttää Overpass API:a massahakuun.
-    Tämä löytää KAIKKI kohteet, ei vain muutamaa.
-    """
-    print(f"📡 Massahaku Overpass API:lla: {query}...")
-    
-    # 1. Yritetään arvata kaupunki ja toimiala
-    parts = query.split()
-    city = parts[-1] # Oletetaan että viimeinen sana on kaupunki (esim. "Tampere")
-    keyword = parts[0].lower() # Ensimmäinen sana on ala (esim. "Autokorjaamo")
-    
-    # Etsitään oikea tägi sanakirjasta
-    tags = []
-    for key, val in KEYWORD_MAPPING.items():
-        if key in query.lower():
-            tags = val
-            break
-            
-    # Jos ei löydy sanakirjasta, käytetään yleistä nimihakua (vähemmän tarkka)
-    if not tags:
-        print(f"⚠️ Hakusana '{keyword}' ei ole sanakirjassa, käytetään nimihakua.")
-        tags = [f'["name"~"{keyword}",i]'] # i = case insensitive
-
-    # 2. Rakennetaan Overpass QL -kysely
-    # "Hae alueelta X kaikki nodet/wayt joilla on tämä tägi"
-    tag_query = ""
-    for tag in tags:
-        tag_query += f"""
-          node{tag}(area.searchArea);
-          way{tag}(area.searchArea);
-          relation{tag}(area.searchArea);
-        """
-
-    overpass_query = f"""
-    [out:json][timeout:25];
-    area["name"="{city}"]->.searchArea;
-    (
-      {tag_query}
-    );
-    out center;
-    """
-    
-    url = "https://overpass-api.de/api/interpreter"
-    
-    try:
-        response = requests.post(url, data=overpass_query)
-        if response.status_code == 200:
-            data = response.json()
-            elements = data.get('elements', [])
-            print(f"✅ Overpass vastasi: {len(elements)} kohdetta löydetty!")
-            return elements
-        else:
-            print(f"❌ Overpass Virhe: {response.status_code}")
-            return []
-    except Exception as e:
-        print(f"❌ Yhteysvirhe: {e}")
-        return []
-
-@app.get("/")
-def read_root():
-    return {"status": "Agency Hunter API", "version": "OVERPASS MASS MINER"}
-
-@app.get("/leads")
-def get_leads(search_term: str = ""):
-    if not search_term: return []
-
-    print(f"\n--- MASSALOUHINTA: '{search_term}' ---")
-    real_leads = []
-    
-    # 1. HAE DATA (Overpass)
-    raw_results = fetch_mass_data_from_overpass(search_term)
-
-    count = 0
-    seen_names = set()
-
-    for place in raw_results:
-        # Rajoita analyysi esim. 100:aan ettei kestä ikuisuutta
-        if count >= 100: break
-        
-        # Overpass data on joko 'tags' (node) tai 'tags' (way/center)
-        tags = place.get('tags', {})
-        name = tags.get('name')
-        
-        if not name: continue
-        if name in seen_names: continue # Estä tuplat
-        seen_names.add(name)
-        
-        # Suodata isot ketjut pois (ei maksa vaivaa)
-        forbidden = ["katsastus", "a-katsastus", "r-kioski", "s-market", "k-market", "lidl", "abc", "neste", "shell", "teboil", "veho", "metroauto", "hedin", "autokeskus"]
-        if any(bad in name.lower() for bad in forbidden): continue
-
-        # Hae tiedot
-        website = tags.get('website') or tags.get('url') or tags.get('contact:website')
-        phone = tags.get('phone') or tags.get('contact:phone') or tags.get('contact:mobile')
-        
-        # Osoite (katu + numero)
-        street = tags.get('addr:street', '')
-        housenumber = tags.get('addr:housenumber', '')
-        address = f"{street} {housenumber}".strip() or "Osoite puuttuu"
-
-        print(f"Analysoidaan [{count+1}]: {name}...")
-
-        # 2. RIKASTUS
-        if not website:
-            status = "NO WEBSITE 🔴"
-            display_url = "Ei verkkosivua"
-            if phone:
-                name = f"{name} 📞 {phone}" # Näytä numero heti otsikossa
-        else:
-            status = analyze_website(website)
-            display_url = website
-
-        real_leads.append({
-            "id": count + 1,
-            "name": name,
-            "url": display_url,
-            "status": status,
-            "address": address
+        viewport = geometry.get("viewport", {
+            "northeast": {"lat": location["lat"] + 0.05, "lng": location["lng"] + 0.05},
+            "southwest": {"lat": location["lat"] - 0.05, "lng": location["lng"] - 0.05}
         })
-        count += 1
-        
-        # Pieni viive on tärkeä kun käydään sadoilla sivuilla
-        if website: time.sleep(0.05)
+        return viewport
 
-    # Lajittelu: NO WEBSITE ensin
-    real_leads.sort(key=lambda x: "NO WEBSITE" not in x['status'])
-    
-    if not real_leads:
-        print("Ei löytynyt tuloksia. Tarkista että kaupungin nimi on oikein (esim. Tampere).")
+    def generate_grid(self, bounds: Dict) -> List[Dict]:
+        """
+        Generates a grid of points, heavily restricted by MAX_GRID_POINTS_SAFETY.
+        """
+        ne = bounds["northeast"]
+        sw = bounds["southwest"]
+
+        lat_min, lat_max = sw["lat"], ne["lat"]
+        lng_min, lng_max = sw["lng"], ne["lng"]
+
+        # Approximate degrees per meter (Finland)
+        lat_step = (GRID_RADIUS_METERS * 1.5) / 111000
+        lng_step = (GRID_RADIUS_METERS * 1.5) / 55000
+
+        grid_points = []
+        curr_lat = lat_min
         
-    return real_leads
+        # Grid Generation Loop
+        while curr_lat < lat_max:
+            curr_lng = lng_min
+            while curr_lng < lng_max:
+                grid_points.append(f"{curr_lat},{curr_lng}")
+                curr_lng += lng_step
+            curr_lat += lat_step
+
+        # --- SAFETY ENFORCEMENT ---
+        total_points = len(grid_points)
+        if total_points > MAX_GRID_POINTS_SAFETY:
+            logger.warning(f"⚠️ SAFETY LIMIT: Reducing grid from {total_points} to {MAX_GRID_POINTS_SAFETY} points.")
+            # Take the center points (usually most relevant) rather than just the first ones
+            start = max(0, int(total_points/2) - int(MAX_GRID_POINTS_SAFETY/2))
+            return grid_points[start : start + MAX_GRID_POINTS_SAFETY]
+            
+        return grid_points
+
+    def search_place_pagination(self, url: str, params: Dict) -> List[Dict]:
+        """
+        Handles pagination (Next Page Token).
+        Safety: Limit to 2 pages max in Dev mode.
+        """
+        all_results = []
+        next_token = None
+        
+        # Max 2 pages per search in dev mode (40 results max per query)
+        for _ in range(4): 
+            if next_token:
+                params["pagetoken"] = next_token
+                time.sleep(2) # Mandatory Google delay
+
+            data = self._make_request(url, params)
+            results = data.get("results", [])
+            all_results.extend(results)
+            
+            next_token = data.get("next_page_token")
+            if not next_token:
+                break
+        
+        return all_results
+
+    def get_place_details(self, place_id: str) -> Dict:
+        """Fetches details. Requesting only specific fields saves cost/data."""
+        fields = "name,formatted_address,formatted_phone_number,website,url,types,rating,user_ratings_total"
+        params = {"place_id": place_id, "fields": fields}
+        data = self._make_request(DETAILS_URL, params)
+        return data.get("result", {})
+
+class WebsiteAnalyzer:
+    @staticmethod
+    def check_url(url: str) -> str:
+        if not url: return "NO WEBSITE 🔴"
+        
+        domain = urlparse(url).netloc.lower()
+        if any(social in domain for social in ["facebook", "instagram", "linkedin", "tori.fi"]):
+            return "SOCIAL ONLY 🟡"
+
+        if not url.startswith("http"): url = f"http://{url}"
+
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)'}
+            response = requests.get(url, headers=headers, timeout=5)
+            
+            if response.status_code >= 400: return "BROKEN WEBSITE 🔴"
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            title = soup.title.string.lower() if soup.title else ""
+            if "iis windows" in title or "under construction" in title: return "BROKEN WEBSITE 🔴"
+
+            viewport = soup.find("meta", attrs={"name": "viewport"})
+            if viewport: return "MOBILE FRIENDLY 🟢"
+            
+            return "NOT MOBILE OPTIMIZED 🟠"
+        except Exception:
+            return "BROKEN WEBSITE 🔴"
+
+# --- CORE LOGIC ---
+
+@app.get("/leads", response_model=List[Lead])
+async def get_leads(
+    business_type: str = Query(..., description="e.g. autokorjaamo"),
+    city: str = Query(..., description="e.g. Tampere")
+):
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="Server misconfigured: No API Key")
+
+    service = GooglePlacesService(GOOGLE_API_KEY)
+    
+    # 0. Setup
+    google_type = TYPE_MAPPING.get(business_type.lower())
+    search_query = f"{business_type} in {city}"
+    logger.info(f"--- STARTING SAFETY SEARCH: {search_query} ---")
+    
+    unique_places: Dict[str, Dict] = {}
+    
+    # --- PHASE 1: TEXT SEARCH ---
+    logger.info("PHASE 1: Text Search...")
+    params = {"query": search_query}
+    if google_type: params["type"] = google_type
+    
+    text_results = service.search_place_pagination(TEXT_SEARCH_URL, params)
+    
+    for p in text_results:
+        unique_places[p["place_id"]] = p
+        p["_discovery"] = "Text Search"
+        
+    logger.info(f"Phase 1 found {len(text_results)} results.")
+
+    # --- SAFETY CHECK ---
+    # If we already have enough results from Text Search, SKIP GRID SEARCH to save money
+    if len(unique_places) >= MAX_RESULTS_SAFETY:
+        logger.info(f"⚠️ SAFETY LIMIT REACHED ({len(unique_places)}). Skipping Grid Search.")
+    else:
+        # --- PHASE 2: GRID NEARBY SEARCH ---
+        logger.info("PHASE 2: Grid Search...")
+        bounds = service.get_city_bounds(city)
+        
+        if bounds:
+            grid_points = service.generate_grid(bounds)
+            logger.info(f"Grid generated: {len(grid_points)} points.")
+
+            for i, point in enumerate(grid_points):
+                # SAFETY EXIT
+                if len(unique_places) >= MAX_RESULTS_SAFETY:
+                    logger.info("⚠️ Max results reached during grid scan. Stopping early.")
+                    break
+
+                params = {
+                    "location": point,
+                    "radius": GRID_RADIUS_METERS,
+                    "keyword": business_type
+                }
+                if google_type: params["type"] = google_type
+
+                grid_results = service.search_place_pagination(NEARBY_SEARCH_URL, params)
+                
+                for p in grid_results:
+                    if p["place_id"] not in unique_places:
+                        p["_discovery"] = "Grid Search"
+                        unique_places[p["place_id"]] = p
+                
+                logger.info(f"Grid {i+1}/{len(grid_points)} done. Total unique: {len(unique_places)}")
+
+    # --- PHASE 3: ENRICHMENT ---
+    final_leads_data = []
+    
+    def fetch_details_wrapper(pid):
+        base_data = unique_places[pid]
+        details = service.get_place_details(pid)
+        base_data.update(details)
+        return base_data
+
+    logger.info("PHASE 3: Fetching Details...")
+    # Reduce workers for safety
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(fetch_details_wrapper, pid) for pid in unique_places.keys()]
+        for future in as_completed(futures):
+            try:
+                final_leads_data.append(future.result())
+            except Exception: pass
+
+    # --- PHASE 4: WEBSITE ANALYSIS ---
+    logger.info("PHASE 4: Analyzing Websites...")
+    output_leads = []
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_WEBSITE) as executor:
+        future_to_lead = {
+            executor.submit(WebsiteAnalyzer.check_url, lead.get("website")): lead 
+            for lead in final_leads_data
+        }
+        
+        id_counter = 1
+        for future in as_completed(future_to_lead):
+            lead_data = future_to_lead[future]
+            status = future.result()
+            
+            output_leads.append(Lead(
+                id=id_counter,
+                name=lead_data.get("name", "Unknown"),
+                place_id=lead_data.get("place_id", ""),
+                types=lead_data.get("types", []),
+                address=lead_data.get("formatted_address") or lead_data.get("vicinity", ""),
+                phone=lead_data.get("formatted_phone_number"),
+                website=lead_data.get("website"),
+                status=status,
+                rating=lead_data.get("rating"),
+                user_ratings_total=lead_data.get("user_ratings_total"),
+                discovery_method=lead_data.get("_discovery", "Unknown")
+            ))
+            id_counter += 1
+
+    # Sorting
+    output_leads.sort(key=lambda x: 0 if "NO WEBSITE" in x.status else 1)
+    
+    return output_leads
