@@ -61,3 +61,5 @@ postgres_data/
 
 # --- Käyttöjärjestelmän turhat ---
 .DS_Store
+
+main.py/

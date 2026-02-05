@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 # 1. API Key Setup
 # Option A: Export in terminal (Best practice) -> export GOOGLE_MAPS_API_KEY="AIza..."
 # Option B: Paste here for quick testing (Don't commit to GitHub!)
-GOOGLE_API_KEY = "AIzaSy...SINUN_PITKÄ_AVAIMESI_TÄHÄN"
+GOOGLE_API_KEY = ""
 # GOOGLE_API_KEY = "PASTE_YOUR_KEY_HERE_IF_TESTING_LOCALLY"
 
 # 2. HARD SAFETY LIMITS (DEV MODE)
@@ -91,6 +91,22 @@ class GooglePlacesService:
         """Wrapper for API requests with basic error handling."""
         if not self.key:
             logger.error("No API Key provided.")
+            return {}
+            
+        params["key"] = self.key
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            
+            # --- LISÄTTY DEBUG-RIVI ---
+            # Tämä tulostaa Googlen tarkan virheilmoituksen terminaaliin!
+            if "error_message" in response.text or "status" in response.text:
+                 print(f"🔴 GOOGLE VASTAUS: {response.text}")
+            # --------------------------
+
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Google API Error: {e}")
             return {}
             
         params["key"] = self.key
