@@ -1,16 +1,21 @@
 export interface Lead {
-  id: number | string; // String manuaalisille, number APIsta
+  id: number;
   name: string;
-  url: string;
-  status: string; // "NO WEBSITE", "MOBILE FRIENDLY" jne.
-  address: string;
-  phone?: string;
-  discovery_method?: string;
+  company_name: string;
+  address: string | null;
+  phone: string | null;
+  website: string | null;
+  status: string; // Backendin status
+  source: string;
+  notes: string | null;
+  google_place_id: string | null;
+  url?: string; // Frontendin apukenttä
 }
 
-// Laajennettu versio tallennetulle liidille
+export type PipelineStatus = 'new' | 'contacted' | 'meeting' | 'negotiation' | 'won' | 'lost';
+
+// CRM-näkymän käyttämä laajennettu tyyppi
 export interface SavedLead extends Lead {
-  pipelineStatus: 'New' | 'Contacted' | 'Meeting' | 'Deal' | 'Lost';
-  notes: string;
-  savedAt: string;
+  pipelineStatus?: PipelineStatus;
+  savedAt?: string;
 }
